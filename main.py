@@ -2,6 +2,7 @@ import logging
 import asyncio
 import os
 import random
+import json
 from contextlib import suppress
 from aiogram.exceptions import TelegramBadRequest
 from aiogram import Bot, Dispatcher, types, F
@@ -23,6 +24,7 @@ dp = Dispatcher()
 USE_PROXY = True
 USE_BLACKLIST = True
 BLACKLIST_FILE = "seen_sellers.txt"
+SEARCH_HISTORY_FILE = "search_history.json"
 
 def load_blacklist():
     if not os.path.exists(BLACKLIST_FILE):
@@ -34,6 +36,19 @@ def save_to_blacklist(supplier_ids):
     with open(BLACKLIST_FILE, "a") as f:
         for sid in supplier_ids:
             f.write(f"{sid}\n")
+
+def load_search_history():
+    if not os.path.exists(SEARCH_HISTORY_FILE):
+        return {}
+    try:
+        with open(SEARCH_HISTORY_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except:
+        return {}
+
+def save_search_history(history):
+    with open(SEARCH_HISTORY_FILE, "w", encoding="utf-8") as f:
+        json.dump(history, f, ensure_ascii=False, indent=2)
 
 def get_main_menu():
     kb = [
@@ -233,7 +248,9 @@ async def toggle_blacklist(callback: CallbackQuery):
 async def clear_blacklist(callback: CallbackQuery):
     if os.path.exists(BLACKLIST_FILE):
         os.remove(BLACKLIST_FILE)
-    await callback.answer("✅ История просмотров очищена!")
+    if os.path.exists(SEARCH_HISTORY_FILE):
+        os.remove(SEARCH_HISTORY_FILE)
+    await callback.answer("✅ История просмотров и прогресс страниц очищены!")
 
 @dp.callback_query(F.data == "categories")
 async def cb_categories(callback: CallbackQuery):
@@ -331,30 +348,53 @@ async def run_search(message: Message, query_input: str, is_callback: bool = Fal
     try:
         all_raw_products = []
         blacklist = load_blacklist() if USE_BLACKLIST else set()
+        search_history = load_search_history()
+        updated_history = search_history.copy()
         
         # 1. СБОР ТОВАРОВ (Асинхронно по всем запросам)
         async def fetch_query_products(q):
+            clean_q = q.lower().strip()
+            # Определяем стартовую страницу. Если нет в истории - 1.
+            start_page = search_history.get(clean_q, 1)
+            # Если дошли до 100 страницы, сбрасываем на 1
+            if start_page > 100: start_page = 1
+            
+            end_page = start_page + 10
+            updated_history[clean_q] = end_page # Запоминаем, откуда начать в следующий раз
+            
             q_products = []
             sort = random.choice(['popular', 'newly', 'priceup', 'pricedown', 'rate'])
-            # Сканируем по 5 страниц для каждого запроса (чтобы не перегружать)
-            for p_idx in range(1, 6):
+            
+            # Сканируем диапазон 10 страниц (например 1-11, 11-21 и т.д.)
+            for p_idx in range(start_page, end_page):
                 res = await api.search_products(q, limit=100, page=p_idx, sort=sort)
                 if not res: break
+                
                 q_products.extend(res)
-                await asyncio.sleep(0.1)
-            return q_products
+                # Если страница явно неполная, значит товары кончились раньше времени
+                if len(res) < 10: break 
+                
+                await asyncio.sleep(0.15)
+            return q_products, start_page, end_page
 
-        await msg_to_edit.edit_text(f"⏳ Собираю выдачу по {len(queries)} запросам параллельно...", parse_mode="Markdown")
+        await msg_to_edit.edit_text(f"⏳ Собираю товары...", parse_mode="Markdown")
         
-        # Запускаем сбор для всех запросов одновременно
+        # Запускаем сбор
         tasks = [fetch_query_products(q) for q in queries]
         results_list = await asyncio.gather(*tasks)
         
-        for res in results_list:
-            all_raw_products.extend(res)
+        page_info_str = []
+        for i, (res_products, s_page, e_page) in enumerate(results_list):
+            all_raw_products.extend(res_products)
+            q_name = queries[i]
+            page_info_str.append(f"• {q_name}: стр. {s_page}-{e_page-1}")
+
+        # Сохраняем новую историю страниц
+        save_search_history(updated_history)
 
         if not all_raw_products:
-            await msg_to_edit.edit_text("😔 Ни по одному запросу ничего не найдено.")
+            info = "\n".join(page_info_str)
+            await msg_to_edit.edit_text(f"😔 Ничего не найдено в диапазонах:\n{info}\n\nПопробуйте повторить запрос, чтобы проверить следующие страницы.")
             return
 
         # Убираем дубликаты товаров и фильтруем по черному списку
